@@ -69,13 +69,19 @@ class MeshCoreConfig(Config):
         self.YSIZE = 10000
 
         # MeshCore-specific radio parameters
-        self.FREQ = 869.525  # EU ISM band (MHz)
-        self.BW = 250  # 250 kHz bandwidth
+        # Use EU868 region settings
+        self.REGION = self.regions["EU868"]
+        self.PTX = self.REGION["power_limit"]  # 27 dBm for EU868
+        self.FREQ = 869.525e6  # EU ISM band in Hz (not MHz!)
+        self.BW = 250e3  # 250 kHz bandwidth in Hz
         self.SF = 11  # Spreading factor 11
 
         # MeshCore uses higher hop limits
         self.hopLimit = 7  # Default hop limit
         self.maxHopLimit = 64  # Maximum allowed
+
+        # Print debug info on startup
+        print(f"[CONFIG] PTX={self.PTX}dBm, FREQ={self.FREQ/1e6}MHz, Sensitivity={self.SENSMODEM[self.MODEM]}dBm")
 
     def to_dict(self) -> dict:
         """Convert config to JSON-serializable dict."""
@@ -226,7 +232,9 @@ class MeshCoreSimulator:
         path_loss = phy.estimate_path_loss(self.config, dist, self.config.FREQ, node1.z, node2.z)
         rssi = self.config.PTX + node1.antenna_gain - path_loss
         snr = rssi - self.config.NOISE_LEVEL
-        can_receive = bool(rssi >= self.config.SENSMODEM[self.config.MODEM])
+        sensitivity = self.config.SENSMODEM[self.config.MODEM]
+        can_receive = bool(rssi >= sensitivity)
+
 
         return {
             'distance': float(round(dist, 1)),
@@ -730,10 +738,11 @@ def simulate_meshcore_broadcast(from_node: int, hop_limit: int = 7) -> dict:
 def simulate_meshcore_dm(from_node: int, to_node: int) -> dict:
     """Simulate a MeshCore direct message.
 
-    MeshCore uses path-based routing:
-    1. First check cached routes
-    2. If no cached route, do a discovery flood
+    MeshCore uses path-based routing (NOT flood routing):
+    1. First check cached routes - if found, use direct path routing
+    2. If no cached route, do a ONE-TIME discovery flood through repeaters only
     3. Cache the discovered path for future use
+    4. Subsequent messages use the cached path directly (no flood)
     """
     if from_node not in simulator.nodes or to_node not in simulator.nodes:
         return {
@@ -746,33 +755,41 @@ def simulate_meshcore_dm(from_node: int, to_node: int) -> dict:
 
     hop_limit = simulator.nodes[from_node].hop_limit
     used_cache = False
+    path = []
 
-    # Check for cached route
+    # Check for cached route FIRST - this is the key MeshCore behavior
     cache_key = (from_node, to_node)
     if cache_key in simulator.global_route_cache:
-        path = simulator.global_route_cache[cache_key]
-        if len(path) - 1 <= hop_limit:
+        cached_path = simulator.global_route_cache[cache_key]
+        # Verify the cached path is still valid (all links work)
+        path_valid = True
+        for i in range(len(cached_path) - 1):
+            if cached_path[i] not in simulator.nodes or cached_path[i+1] not in simulator.nodes:
+                path_valid = False
+                break
+            n1 = simulator.nodes[cached_path[i]]
+            n2 = simulator.nodes[cached_path[i+1]]
+            link = simulator.calculate_link_quality(n1, n2)
+            if not link['canReceive']:
+                path_valid = False
+                break
+
+        if path_valid and len(cached_path) - 1 <= hop_limit:
+            path = cached_path
             used_cache = True
             print(f"[MESHCORE DM] Using cached route: {path}")
 
+    # If no valid cached path, discover route using BFS (simulates the initial flood discovery)
     if not used_cache:
-        # Do discovery flood to find path
-        flood_result = simulate_meshcore_broadcast(from_node, hop_limit)
+        print(f"[MESHCORE DM] No cached route, discovering path via BFS...")
+        path = simulator.find_path_bfs(from_node, to_node, hop_limit)
 
-        # Check if destination was reached
-        destination_reached = False
-        for node_info in flood_result.get('nodes', []):
-            if node_info['id'] == to_node and node_info['status'] == 'received':
-                destination_reached = True
-                break
-
-        if destination_reached:
-            path = reconstruct_path(flood_result, from_node, to_node)
-            # Cache the path
-            if path:
-                simulator.global_route_cache[cache_key] = path
-                # Also cache reverse path
-                simulator.global_route_cache[(to_node, from_node)] = list(reversed(path))
+        if path:
+            # Cache the discovered path for future use
+            simulator.global_route_cache[cache_key] = path
+            # Also cache reverse path
+            simulator.global_route_cache[(to_node, from_node)] = list(reversed(path))
+            print(f"[MESHCORE DM] Discovered and cached path: {path}")
         else:
             return {
                 'delivered': False,
@@ -781,15 +798,14 @@ def simulate_meshcore_dm(from_node: int, to_node: int) -> dict:
                 'path': [],
                 'hops': [],
                 'totalHops': 0,
-                'propagation': flood_result.get('propagation', []),
-                'floodResult': flood_result,
+                'propagation': [],
                 'hopLimit': hop_limit,
-                'reason': f'Message died after {hop_limit} hops - destination not reached',
+                'reason': f'No route found within {hop_limit} hops (only repeaters/room servers can relay)',
                 'usedCache': False,
                 'protocol': 'MeshCore'
             }
 
-    # Build hop details for the path
+    # Build hop details for the path (path-based, NOT flood)
     hops = []
     for i in range(len(path) - 1):
         n1 = simulator.nodes[path[i]]
@@ -804,7 +820,8 @@ def simulate_meshcore_dm(from_node: int, to_node: int) -> dict:
             'quality': int(link['signalQuality'])
         })
 
-    # Generate path-based propagation animation (not flood)
+    # MeshCore path-based propagation - ONE packet traveling the path, NOT flooding
+    # Each hop is a single transmission from one node to the next
     propagation = []
     for i, hop in enumerate(hops):
         propagation.append({
@@ -830,12 +847,17 @@ def simulate_meshcore_dm(from_node: int, to_node: int) -> dict:
         'hopLimit': hop_limit,
         'reason': None,
         'usedCache': used_cache,
+        'routingMode': 'path',  # Indicates this used path-based routing
         'protocol': 'MeshCore'
     }
 
 
 def simulate_meshcore_traceroute(from_node: int, to_node: int) -> dict:
-    """Simulate MeshCore traceroute."""
+    """Simulate MeshCore traceroute using path-based routing.
+
+    Uses BFS to find the shortest path through repeaters/room servers.
+    Does NOT flood - traces the actual path the message would take.
+    """
     if from_node not in simulator.nodes or to_node not in simulator.nodes:
         return {
             'reachable': False,
@@ -847,26 +869,17 @@ def simulate_meshcore_traceroute(from_node: int, to_node: int) -> dict:
 
     hop_limit = simulator.nodes[from_node].hop_limit
 
-    # Use discovery flood to find path
-    flood_result = simulate_meshcore_broadcast(from_node, hop_limit)
+    # Find path using BFS (path-based routing, not flood)
+    path = simulator.find_path_bfs(from_node, to_node, hop_limit)
+    destination_reached = len(path) > 0
 
-    destination_reached = False
-    for node_info in flood_result.get('nodes', []):
-        if node_info['id'] == to_node and node_info['status'] == 'received':
-            destination_reached = True
-            break
-
-    path = []
     hops = []
     total_latency = 0
 
     if destination_reached:
-        path = reconstruct_path(flood_result, from_node, to_node)
-
         # Cache the discovered path
-        if path:
-            simulator.global_route_cache[(from_node, to_node)] = path
-            simulator.global_route_cache[(to_node, from_node)] = list(reversed(path))
+        simulator.global_route_cache[(from_node, to_node)] = path
+        simulator.global_route_cache[(to_node, from_node)] = list(reversed(path))
 
         for i, node_id in enumerate(path):
             node = simulator.nodes[node_id]
@@ -895,7 +908,7 @@ def simulate_meshcore_traceroute(from_node: int, to_node: int) -> dict:
 
             hops.append(hop_info)
 
-    # Generate path-based propagation
+    # Generate path-based propagation (single packet traveling the path)
     propagation = []
     for i in range(len(path) - 1):
         n1 = simulator.nodes[path[i]]
@@ -922,9 +935,9 @@ def simulate_meshcore_traceroute(from_node: int, to_node: int) -> dict:
         'totalHops': len(path) - 1 if path else 0,
         'totalLatency': float(round(total_latency, 1)),
         'propagation': propagation,
-        'floodResult': flood_result,
         'hopLimit': hop_limit,
-        'reason': None if destination_reached else f'Message died after {hop_limit} hops - destination not reached',
+        'routingMode': 'path',  # Indicates path-based routing
+        'reason': None if destination_reached else f'No route found within {hop_limit} hops (only repeaters/room servers can relay)',
         'protocol': 'MeshCore'
     }
 

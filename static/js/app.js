@@ -6,6 +6,7 @@
 // ============== State Management ==============
 const state = {
     nodes: new Map(),
+    links: [],  // Topology links from backend with actual radio link quality
     selectedNodes: new Set(),
     config: null,
     socket: null,
@@ -26,6 +27,7 @@ const state = {
     // Interaction state
     editingNode: null,
     highlightedRoute: null,
+    hoveredNode: null,  // Node ID of node under cursor (for enhanced coverage display)
 
     // Map tiles
     tileCache: new Map(),
@@ -89,25 +91,18 @@ function startRenderLoop() {
     lastRenderTime = performance.now();
 
     // Restart the appropriate animation based on type
+    // MeshCore uses path-based routing for DM and traceroute
     switch (state.animation.type) {
         case 'broadcast':
             requestAnimationFrame(animateBroadcast);
             break;
         case 'dm':
-            // Check if using flood or path-based animation
-            if (state.animation.data.propagation && state.animation.data.propagation.length > 0) {
-                requestAnimationFrame(animateDMFlood);
-            } else {
-                requestAnimationFrame(animateDM);
-            }
+            // MeshCore: use path-based animation
+            requestAnimationFrame(animateDMPath);
             break;
         case 'traceroute':
-            // Check if using flood or path-based animation
-            if (state.animation.data.propagation && state.animation.data.propagation.length > 0) {
-                requestAnimationFrame(animateTracerouteFlood);
-            } else {
-                requestAnimationFrame(animateTraceroute);
-            }
+            // MeshCore: use path-based animation
+            requestAnimationFrame(animateTraceroutePath);
             break;
         default:
             renderLoopRunning = false;
@@ -219,23 +214,29 @@ function initSocket() {
         log('Disconnected from server', 'warning');
     });
 
-    state.socket.on('node_added', (node) => {
+    state.socket.on('node_added', async (node) => {
         state.nodes.set(node.id, node);
+        // Topology changed - refresh links
+        await updateTopologyLinks();
         updateNodeList();
         updateCommandSelects();
         render();
         log(`Node ${node.id} (${node.name}) added`, 'success');
     });
 
-    state.socket.on('node_updated', (node) => {
+    state.socket.on('node_updated', async (node) => {
         state.nodes.set(node.id, node);
+        // Topology changed - refresh links
+        await updateTopologyLinks();
         updateNodeList();
         render();
     });
 
-    state.socket.on('node_removed', (data) => {
+    state.socket.on('node_removed', async (data) => {
         state.nodes.delete(data.id);
         state.selectedNodes.delete(data.id);
+        // Topology changed - refresh links
+        await updateTopologyLinks();
         updateNodeList();
         updateCommandSelects();
         render();
@@ -244,6 +245,7 @@ function initSocket() {
 
     state.socket.on('nodes_cleared', () => {
         state.nodes.clear();
+        state.links = [];  // Clear topology links too
         state.selectedNodes.clear();
         updateNodeList();
         updateCommandSelects();
@@ -532,11 +534,25 @@ async function loadNodes() {
             state.nodes.set(node.id, node);
         });
 
+        // Also fetch topology to get actual radio link quality
+        await updateTopologyLinks();
+
         updateNodeList();
         updateCommandSelects();
         render();
     } catch (error) {
         log('Failed to load nodes', 'error');
+    }
+}
+
+async function updateTopologyLinks() {
+    try {
+        const topology = await getTopology();
+        state.links = topology.links || [];
+        console.log(`Loaded ${state.links.length} radio links from topology`);
+    } catch (error) {
+        console.error('Failed to load topology links:', error);
+        state.links = [];
     }
 }
 
@@ -760,41 +776,37 @@ function drawScaleBar() {
 
 function drawLinks() {
     const ctx = state.ctx;
-    const nodesArray = Array.from(state.nodes.values());
 
-    // Draw all possible links
-    for (let i = 0; i < nodesArray.length; i++) {
-        for (let j = i + 1; j < nodesArray.length; j++) {
-            const n1 = nodesArray[i];
-            const n2 = nodesArray[j];
+    // Use actual radio links from topology (computed by backend with proper path loss model)
+    // Only draw links where canReceive is true (i.e., RSSI >= sensitivity threshold)
+    for (const link of state.links) {
+        const n1 = state.nodes.get(link.source);
+        const n2 = state.nodes.get(link.target);
 
-            // Simple distance-based check for visibility
-            const dist = Math.sqrt(Math.pow(n1.x - n2.x, 2) + Math.pow(n1.y - n2.y, 2));
-            const maxRange = Math.max(n1.coverageRadius || 5000, n2.coverageRadius || 5000);
+        if (!n1 || !n2) continue;
 
-            if (dist < maxRange) {
-                const p1 = worldToScreen(n1.x, n1.y);
-                const p2 = worldToScreen(n2.x, n2.y);
+        // Link already filtered by backend to only include canReceive=true
+        const p1 = worldToScreen(n1.x, n1.y);
+        const p2 = worldToScreen(n2.x, n2.y);
 
-                // Calculate signal quality for color
-                const quality = 1 - (dist / maxRange);
+        // Use actual signal quality from backend (0-100%)
+        const quality = link.signalQuality / 100;
 
-                ctx.beginPath();
-                ctx.moveTo(p1.x, p1.y);
-                ctx.lineTo(p2.x, p2.y);
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+        ctx.lineTo(p2.x, p2.y);
 
-                if (quality > 0.5) {
-                    ctx.strokeStyle = `rgba(15, 155, 15, ${0.3 + quality * 0.4})`;
-                } else if (quality > 0.25) {
-                    ctx.strokeStyle = `rgba(243, 156, 18, ${0.3 + quality * 0.4})`;
-                } else {
-                    ctx.strokeStyle = `rgba(233, 69, 96, ${0.3 + quality * 0.4})`;
-                }
-
-                ctx.lineWidth = 2;
-                ctx.stroke();
-            }
+        // Color based on signal quality (green=good, yellow=fair, red=poor)
+        if (quality > 0.6) {
+            ctx.strokeStyle = `rgba(15, 155, 15, ${0.4 + quality * 0.4})`;
+        } else if (quality > 0.3) {
+            ctx.strokeStyle = `rgba(243, 156, 18, ${0.4 + quality * 0.3})`;
+        } else {
+            ctx.strokeStyle = `rgba(233, 69, 96, ${0.4 + quality * 0.3})`;
         }
+
+        ctx.lineWidth = 2;
+        ctx.stroke();
     }
 }
 
@@ -827,19 +839,40 @@ function drawNode(node) {
 
     const isSelected = state.selectedNodes.has(node.id);
     const isDragging = state.draggedNode && state.draggedNode.id === node.id;
+    const isHovered = state.hoveredNode === node.id;
     const radius = isSelected ? 14 : 12;
 
-    // Coverage area
+    // Coverage area - enhanced when hovered to show max radio range clearly
     const mpp = metersPerPixel(state.mapCenter.lat, state.zoomLevel);
-    if (node.coverageRadius && node.coverageRadius / mpp > 20) {
+    if (node.coverageRadius && node.coverageRadius / mpp > 10) {
         const coverageScreenRadius = node.coverageRadius / mpp;
         ctx.beginPath();
         ctx.arc(pos.x, pos.y, coverageScreenRadius, 0, Math.PI * 2);
-        ctx.fillStyle = getRoleColor(node.role, 0.15);
-        ctx.fill();
-        ctx.strokeStyle = getRoleColor(node.role, 0.3);
-        ctx.lineWidth = 1;
-        ctx.stroke();
+
+        if (isHovered) {
+            // Enhanced coverage display on hover - more visible
+            ctx.fillStyle = getRoleColor(node.role, 0.25);
+            ctx.fill();
+            ctx.strokeStyle = getRoleColor(node.role, 0.8);
+            ctx.lineWidth = 2;
+            ctx.setLineDash([8, 4]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // Show coverage distance label
+            const rangeKm = (node.coverageRadius / 1000).toFixed(1);
+            ctx.font = 'bold 11px sans-serif';
+            ctx.fillStyle = '#ffffff';
+            ctx.textAlign = 'center';
+            ctx.fillText(`${rangeKm}km range`, pos.x, pos.y + coverageScreenRadius + 15);
+        } else {
+            // Normal coverage display
+            ctx.fillStyle = getRoleColor(node.role, 0.15);
+            ctx.fill();
+            ctx.strokeStyle = getRoleColor(node.role, 0.3);
+            ctx.lineWidth = 1;
+            ctx.stroke();
+        }
     }
 
     // Node shadow
@@ -1036,6 +1069,13 @@ function handleMouseMove(e) {
     if (!state.isDragging) {
         const hoveredNode = findNodeAtPosition(screenX, screenY);
         state.canvas.style.cursor = hoveredNode ? 'grab' : 'crosshair';
+
+        // Track hovered node for enhanced coverage display
+        const previousHovered = state.hoveredNode;
+        state.hoveredNode = hoveredNode ? hoveredNode.id : null;
+        if (previousHovered !== state.hoveredNode) {
+            render(); // Re-render to show/hide enhanced coverage circle
+        }
     }
 
     if (state.isDragging) {
@@ -1509,10 +1549,9 @@ function animateBroadcast(timestamp) {
 function startDMAnimation(simulation) {
     console.log('Starting DM animation:', simulation);
 
-    // DM now uses flood propagation like broadcast
-    // Show the flood, then highlight the path to destination (if reached)
+    // MeshCore uses PATH-BASED routing, not flood routing
+    // Show a single packet traveling along the discovered/cached path
 
-    // Get target node from destination field (works even when path is empty)
     const targetNode = simulation.destination !== undefined ? simulation.destination :
                        (simulation.path && simulation.path.length > 0 ? simulation.path[simulation.path.length - 1] : null);
 
@@ -1525,37 +1564,31 @@ function startDMAnimation(simulation) {
         nodeStates: new Map(),
         currentHop: 0,
         destinationReached: simulation.delivered,
-        targetNode: targetNode
+        targetNode: targetNode,
+        routingMode: simulation.routingMode || 'path'
     };
 
-    // If we have flood/propagation data, use broadcast-style animation
-    if (simulation.propagation && simulation.propagation.length > 0) {
-        // Set up node states from flood result
-        const floodResult = simulation.floodResult || simulation;
-        if (floodResult.nodes) {
-            floodResult.nodes.forEach(n => {
-                state.animation.nodeStates.set(n.id, {
-                    status: n.status,
-                    hop: n.hop,
-                    rssi: n.rssi || 0,
+    if (simulation.delivered && simulation.hops && simulation.hops.length > 0) {
+        // Path-based animation - show packet traveling along the path
+        state.highlightedRoute = simulation.path || [];
+
+        // Set up node states for path nodes only
+        if (simulation.path) {
+            simulation.path.forEach((nodeId, index) => {
+                state.animation.nodeStates.set(nodeId, {
+                    status: index === 0 ? 'source' : 'pending',
+                    hop: index,
+                    rssi: 0,
                     pulsePhase: 0,
-                    isTarget: n.id === state.animation.targetNode
+                    isTarget: nodeId === targetNode
                 });
             });
         }
 
-        // Render immediately to show initial state, then start animation loop
         render();
         renderLoopRunning = true;
         startAnimationFallback();
-        requestAnimationFrame(animateDMFlood);
-    } else if (simulation.delivered && simulation.hops && simulation.hops.length > 0) {
-        // Fallback to old path-based animation
-        state.highlightedRoute = simulation.path || [];
-        render();
-        renderLoopRunning = true;
-        startAnimationFallback();
-        requestAnimationFrame(animateDM);
+        requestAnimationFrame(animateDMPath);
     } else {
         log(`DM failed - ${simulation.reason || 'no route available'}`, 'error');
         state.animation.active = false;
@@ -1563,79 +1596,92 @@ function startDMAnimation(simulation) {
     }
 }
 
-function animateDMFlood(timestamp) {
-    // DM flood animation - shows message flooding out in all directions
+function animateDMPath(timestamp) {
+    // MeshCore path-based DM animation - single packet traveling along the path
     if (!state.animation.active || state.animation.type !== 'dm') return;
 
     const elapsed = timestamp - state.animation.startTime;
-    const hopDuration = 1000;
-    const currentHop = Math.floor(elapsed / hopDuration);
-    const hopProgress = (elapsed % hopDuration) / hopDuration;
-
     const simulation = state.animation.data;
-    const propagation = simulation.propagation || [];
+    const hops = simulation.hops || [];
+    const hopDuration = 1000; // ms per hop - slower for visibility
 
-    // Update packets for current hop
+    // Debug on first frame
+    if (elapsed < 50) {
+        console.log('DM Animation starting:', {
+            path: simulation.path,
+            hops: hops,
+            hopCount: hops.length,
+            delivered: simulation.delivered
+        });
+    }
+
     state.animation.packets = [];
 
-    if (currentHop < propagation.length) {
-        const hopData = propagation[currentHop];
-        hopData.transmissions.forEach(tx => {
-            const fromNode = getNodeById(tx.from);
-            const toNode = getNodeById(tx.to);
+    if (simulation.delivered && hops.length > 0) {
+        const totalProgress = elapsed / hopDuration;
+        const currentHopIndex = Math.floor(totalProgress);
+        const hopProgress = totalProgress - currentHopIndex;
+
+        // Mark nodes as received as the packet passes through
+        if (simulation.path) {
+            for (let i = 0; i <= Math.min(currentHopIndex + 1, simulation.path.length - 1); i++) {
+                const nodeState = state.animation.nodeStates.get(simulation.path[i]);
+                if (nodeState && nodeState.status !== 'source') {
+                    nodeState.status = 'received';
+                    nodeState.pulsePhase = Math.max(0, 1 - (currentHopIndex - i + 1) * 0.3);
+                }
+            }
+        }
+
+        // Show packet traveling current hop
+        if (currentHopIndex < hops.length) {
+            const hop = hops[currentHopIndex];
+            const fromNode = getNodeById(hop.from);
+            const toNode = getNodeById(hop.to);
+
             if (fromNode && toNode) {
+                // Debug current hop
+                if (hopProgress < 0.05) {
+                    console.log(`Animating hop ${currentHopIndex}: ${hop.from} -> ${hop.to}, progress: ${hopProgress.toFixed(2)}`);
+                }
+
                 state.animation.packets.push({
                     fromX: fromNode.x,
                     fromY: fromNode.y,
                     toX: toNode.x,
                     toY: toNode.y,
-                    progress: hopProgress,
-                    rssi: tx.rssi,
+                    progress: Math.min(1, hopProgress),
+                    rssi: hop.rssi,
                     isDM: true
                 });
+            } else {
+                console.warn('Could not find nodes for hop:', hop, 'fromNode:', fromNode, 'toNode:', toNode);
             }
-        });
-
-        // Update node states
-        if (hopProgress > 0.8) {
-            hopData.transmissions.forEach(tx => {
-                const nodeState = state.animation.nodeStates.get(tx.to);
-                if (nodeState && nodeState.status !== 'received') {
-                    nodeState.status = 'receiving';
-                    nodeState.pulsePhase = 1;
-                }
-            });
         }
+
+        state.animation.currentHop = currentHopIndex;
     }
 
-    // Update pulse phases
-    state.animation.nodeStates.forEach((nodeState) => {
-        if (nodeState.pulsePhase > 0) {
-            nodeState.pulsePhase = Math.max(0, nodeState.pulsePhase - 0.02);
-        }
-    });
-
-    state.animation.currentHop = currentHop;
     render();
 
-    // Continue or end animation
-    const totalDuration = (propagation.length + 1) * hopDuration + 2000;
+    const totalDuration = hops.length * hopDuration + 1500;
     if (elapsed < totalDuration) {
-        requestAnimationFrame(animateDMFlood);
+        requestAnimationFrame(animateDMPath);
     } else {
-        // Show final result
-        if (state.animation.destinationReached) {
-            state.highlightedRoute = simulation.path;
-            log(`DM delivered to destination via ${simulation.path.length - 1} hops`, 'success');
+        // Animation complete
+        if (simulation.usedCache) {
+            log(`DM delivered via cached route (${simulation.path.length - 1} hops)`, 'success');
         } else {
-            log(`DM FAILED - message died after ${simulation.hopLimit} hops, destination not reached`, 'error');
+            log(`DM delivered via discovered route (${simulation.path.length - 1} hops) - path now cached`, 'success');
         }
 
+        state.animation.active = false;
+        state.animation.packets = [];
+        renderLoopRunning = false;
+
+        // Keep route highlighted briefly
         setTimeout(() => {
-            state.animation.active = false;
-            state.animation.packets = [];
             state.highlightedRoute = null;
-            renderLoopRunning = false;
             render();
         }, 2000);
     }
@@ -1698,7 +1744,7 @@ function animateDM(timestamp) {
 function startTracerouteAnimation(simulation) {
     console.log('Starting traceroute animation:', simulation);
 
-    // Get target node from destination field (works even when path is empty)
+    // MeshCore traceroute uses PATH-BASED routing
     const targetNode = simulation.destination !== undefined ? simulation.destination :
                        (simulation.path && simulation.path.length > 0 ? simulation.path[simulation.path.length - 1] : null);
 
@@ -1712,40 +1758,117 @@ function startTracerouteAnimation(simulation) {
         currentHop: 0,
         discoveredHops: [],
         destinationReached: simulation.reachable,
-        targetNode: targetNode
+        targetNode: targetNode,
+        routingMode: simulation.routingMode || 'path'
     };
 
     state.highlightedRoute = [];
 
-    // If we have flood/propagation data, use flood-style animation
-    if (simulation.propagation && simulation.propagation.length > 0) {
-        const floodResult = simulation.floodResult || simulation;
-        if (floodResult.nodes) {
-            floodResult.nodes.forEach(n => {
-                state.animation.nodeStates.set(n.id, {
-                    status: n.status,
-                    hop: n.hop,
-                    rssi: n.rssi || 0,
-                    pulsePhase: 0,
-                    isTarget: n.id === targetNode
-                });
+    if (simulation.reachable && simulation.hops && simulation.hops.length > 0) {
+        // Set up node states for path nodes
+        simulation.hops.forEach((hopInfo, index) => {
+            state.animation.nodeStates.set(hopInfo.node, {
+                status: index === 0 ? 'source' : 'pending',
+                hop: index,
+                rssi: hopInfo.rssi || 0,
+                pulsePhase: 0,
+                isTarget: hopInfo.node === targetNode
             });
-        }
-        // Render immediately to show initial state, then start animation loop
+        });
+
         render();
         renderLoopRunning = true;
         startAnimationFallback();
-        requestAnimationFrame(animateTracerouteFlood);
+        requestAnimationFrame(animateTraceroutePath);
     } else {
+        log(`Traceroute failed - ${simulation.reason || 'no route available'}`, 'error');
+        state.animation.active = false;
+        renderLoopRunning = false;
+    }
+}
+
+function animateTraceroutePath(timestamp) {
+    // MeshCore path-based traceroute animation - single packet traveling along the path
+    if (!state.animation.active || state.animation.type !== 'traceroute') return;
+
+    const elapsed = timestamp - state.animation.startTime;
+    const simulation = state.animation.data;
+    const hops = simulation.hops || [];
+    const hopDuration = 600; // ms per hop (slightly faster than DM for traceroute feel)
+
+    state.animation.packets = [];
+
+    if (simulation.reachable && hops.length > 1) {
+        const totalProgress = elapsed / hopDuration;
+        const currentHopIndex = Math.floor(totalProgress);
+        const hopProgress = totalProgress - currentHopIndex;
+
+        // Update discovered path progressively
+        const discoveredPath = hops.slice(0, currentHopIndex + 1).map(h => h.node);
+        state.highlightedRoute = discoveredPath;
+
+        // Mark nodes as discovered
+        for (let i = 0; i <= Math.min(currentHopIndex, hops.length - 1); i++) {
+            const nodeState = state.animation.nodeStates.get(hops[i].node);
+            if (nodeState && nodeState.status !== 'source') {
+                nodeState.status = 'received';
+                nodeState.pulsePhase = Math.max(0, 1 - (currentHopIndex - i) * 0.3);
+            }
+        }
+
+        // Show packet traveling current hop
+        if (currentHopIndex < hops.length - 1) {
+            const fromHop = hops[currentHopIndex];
+            const toHop = hops[currentHopIndex + 1];
+            const fromNode = getNodeById(fromHop.node);
+            const toNode = getNodeById(toHop.node);
+
+            if (fromNode && toNode) {
+                state.animation.packets.push({
+                    fromX: fromNode.x,
+                    fromY: fromNode.y,
+                    toX: toNode.x,
+                    toY: toNode.y,
+                    progress: Math.min(1, hopProgress),
+                    rssi: toHop.rssi,
+                    isTraceroute: true
+                });
+            }
+
+            // Log hop discovery
+            if (hopProgress < 0.1 && currentHopIndex > state.animation.currentHop) {
+                log(`  Hop ${currentHopIndex + 1}: Node ${toHop.node} (${toHop.name}) - ${toHop.rssi.toFixed(0)}dBm, ${toHop.distance.toFixed(0)}m`, 'info');
+            }
+        }
+
+        state.animation.currentHop = currentHopIndex;
+    }
+
+    render();
+
+    const totalDuration = hops.length * hopDuration + 2000;
+    if (elapsed < totalDuration) {
+        requestAnimationFrame(animateTraceroutePath);
+    } else {
+        // Animation complete
+        log(`Traceroute complete: ${simulation.path.length - 1} hops, ${simulation.totalLatency}ms estimated latency`, 'success');
+
+        state.animation.active = false;
+        state.animation.packets = [];
+        renderLoopRunning = false;
+
+        // Keep final route visible longer
+        state.highlightedRoute = simulation.path;
         render();
-        renderLoopRunning = true;
-        startAnimationFallback();
-        requestAnimationFrame(animateTraceroute);
+        setTimeout(() => {
+            state.highlightedRoute = null;
+            render();
+        }, 3000);
     }
 }
 
 function animateTracerouteFlood(timestamp) {
-    // Traceroute flood animation - shows message flooding out
+    // Legacy traceroute flood animation (not used for MeshCore)
     if (!state.animation.active || state.animation.type !== 'traceroute') return;
 
     const elapsed = timestamp - state.animation.startTime;
